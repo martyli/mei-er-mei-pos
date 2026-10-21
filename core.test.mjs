@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {initialState,makeLine,addLine,editLine,orderTotal,holdOrder,resumeOrder,completeSale,dailySummary,validateState,dayKey} from './core.mjs';
+import {initialState,makeLine,addLine,editLine,orderTotal,holdOrder,resumeOrder,completeSale,dailySummary,validateState,dayKey,adjustmentValue,adjustmentMoney,toggleAddonIds,memberBalance,createMember,topUpMember,upgradeState} from './core.mjs';
 import {Store,STORAGE_KEY} from './storage.mjs';
 const now=new Date('2026-10-20T04:00:00Z');
 class MemoryStorage {
@@ -98,4 +98,117 @@ test('valid backup restores orders and counters then survives reload',()=>{
 test('corrupt existing records are preserved instead of silently reset',()=>{
   const memory=new MemoryStorage();memory.setItem(STORAGE_KEY,'{bad JSON');
   assert.throws(()=>new Store(memory));assert.equal(memory.getItem(STORAGE_KEY),'{bad JSON');
+});
+
+function removalState(){
+  const s=initialState(null,null,now);s.catalog.items.find(x=>x.id==='demo3').addonIds.push('no-egg');return s;
+}
+test('negative modifiers apply per portion, coexist with other additions, and survive checkout',()=>{
+  const s=removalState();
+  addLine(s,makeLine(s,'demo3',{addonIds:['no-egg','cheese'],qty:2}));
+  assert.equal(orderTotal(s.draft),70);
+  const sale=completeSale(s,100,now);assert.equal(sale.change,30);
+  assert.equal(sale.lines[0].addons.find(a=>a.id==='no-egg').price,-15);
+  assert.equal(adjustmentMoney(-15),'−$15');assert.equal(adjustmentMoney(10),'+$10');
+  assert.equal(adjustmentValue('-15'),-15);
+  for(const bad of ['',null,'-1.5','-100000'])assert.throws(()=>adjustmentValue(bad));
+  assert.ok(validateState(s));
+});
+test('negative totals are blocked, zero totals are allowed, conflicting egg choices switch',()=>{
+  const s=removalState(),product=s.catalog.items.find(x=>x.id==='demo3');
+  assert.deepEqual(toggleAddonIds(s.catalog.addons,['egg','cheese'],'no-egg'),['cheese','no-egg']);
+  assert.throws(()=>makeLine(s,'demo3',{addonIds:['egg','no-egg']}),/不能同時/);
+  product.price=10;assert.throws(()=>makeLine(s,'demo3',{addonIds:['no-egg']}),/超過/);
+  product.price=15;assert.equal(orderTotal({lines:[makeLine(s,'demo3',{addonIds:['no-egg']})]}),0);
+});
+test('v2 migration preserves all order snapshots, adds preset once and keeps item applicability explicit',()=>{
+  const old=initialState(null,null,now);
+  old.catalog.addons=old.catalog.addons.filter(a=>a.id!=='no-egg');old.schemaVersion=2;delete old.members;delete old.walletEntries;
+  addLine(old,makeLine(old,'demo0',{addonIds:['egg']}));
+  const draft=structuredClone(old.draft),memory=new MemoryStorage();memory.setItem(STORAGE_KEY,JSON.stringify(old));
+  const first=new Store(memory);assert.equal(first.state.schemaVersion,3);assert.deepEqual(first.state.draft,draft);
+  assert.equal(first.state.catalog.addons.find(a=>a.name==='不加蛋').price,-15);
+  assert.ok(first.state.catalog.items.every(p=>!p.addonIds.includes('no-egg')));
+  assert.deepEqual(first.state.members,[]);assert.deepEqual(first.state.walletEntries,[]);
+  first.transaction(s=>{s.catalog.addons=s.catalog.addons.filter(a=>a.id!=='no-egg');});
+  assert.ok(!new Store(memory).state.catalog.addons.some(a=>a.id==='no-egg'));
+  const bad=structuredClone(old);bad.catalog.addons[0].price=-15;assert.throws(()=>upgradeState(bad));
+});
+test('opening balance and deposits form a ledger; duplicate deposits and duplicate phones are rejected',()=>{
+  const s=initialState(null,null,now),m=createMember(s,{name:'測試會員',phone:'0912-000-001',openingBalance:200},now);
+  topUpMember(s,m.id,500,'現金','topup-1',now);
+  assert.equal(memberBalance(s,m.id),700);
+  assert.throws(()=>topUpMember(s,m.id,500,'現金','topup-1',now),/已完成/);
+  assert.throws(()=>createMember(s,{name:'另一會員',phone:'0912000001'},now),/已有會員/);
+  assert.throws(()=>topUpMember(s,m.id,-1),/整數/);
+  assert.deepEqual([dailySummary(s,dayKey(now)).revenue,dailySummary(s,dayKey(now)).topupCash],[0,500]);
+  assert.ok(validateState(s));
+});
+test('full stored-value payment deducts once and keeps sale and wallet balance consistent',()=>{
+  const s=removalState(),m=createMember(s,{name:'測試會員',openingBalance:100},now);
+  addLine(s,makeLine(s,'demo3',{addonIds:['no-egg']}));const orderId=s.draft.id;
+  const sale=completeSale(s,0,now,{memberId:m.id,expectedOrderId:orderId});
+  assert.deepEqual([sale.total,sale.walletAmount,sale.paid,sale.change,sale.balanceAfter],[25,25,0,0,75]);
+  assert.equal(sale.payment,'wallet');assert.equal(memberBalance(s,m.id),75);
+  assert.throws(()=>completeSale(s,0,now,{memberId:m.id,expectedOrderId:orderId}),/已結帳/);
+  assert.equal(s.walletEntries.filter(e=>e.type==='spend').length,1);
+  assert.ok(validateState(s));
+});
+test('split payment takes available wallet credit and cash shortage without overdraft',()=>{
+  const s=initialState(null,null,now),m=createMember(s,{name:'測試會員',openingBalance:20},now);
+  addLine(s,makeLine(s,'demo0'));
+  assert.throws(()=>completeSale(s,24,now,{memberId:m.id,cashFallback:true}),/不足/);
+  assert.equal(memberBalance(s,m.id),20);assert.equal(s.sales.length,0);
+  const sale=completeSale(s,100,now,{memberId:m.id,cashFallback:true});
+  assert.deepEqual([sale.payment,sale.walletAmount,sale.paid,sale.change,sale.balanceAfter],['mixed',20,100,75,0]);
+  assert.equal(memberBalance(s,m.id),0);
+  const summary=dailySummary(s,dayKey(now));assert.deepEqual([summary.revenue,summary.walletSales,summary.cashSales],[45,20,25]);
+  assert.ok(validateState(s));
+});
+test('cash checkout does not affect any member wallet',()=>{
+  const s=initialState(null,null,now),m=createMember(s,{name:'測試會員',openingBalance:300},now);
+  addLine(s,makeLine(s,'demo0'));completeSale(s,100,now);
+  assert.equal(memberBalance(s,m.id),300);assert.equal(s.walletEntries.length,1);
+  assert.ok(validateState(s));
+});
+test('failed wallet checkout and deposit storage writes preserve balances, draft and ledger',()=>{
+  const memory=new MemoryStorage(),store=new Store(memory);const m=store.transaction(s=>createMember(s,{name:'測試會員',openingBalance:100},now));
+  store.transaction(s=>addLine(s,makeLine(s,'demo0')));
+  const before=store.raw;memory.fail=true;
+  assert.throws(()=>store.transaction(s=>completeSale(s,0,now,{memberId:m.id})),{name:'QuotaExceededError'});
+  assert.throws(()=>store.transaction(s=>topUpMember(s,m.id,50)),{name:'QuotaExceededError'});
+  assert.equal(store.raw,before);assert.equal(memberBalance(store.state,m.id),100);assert.equal(store.state.sales.length,0);assert.equal(store.state.draft.lines.length,1);
+});
+test('member wallet backup restores exactly and rejects missing or tampered ledger records',()=>{
+  const s=initialState(null,null,now),m=createMember(s,{name:'測試會員',openingBalance:100},now);
+  topUpMember(s,m.id,200,'','deposit',now);addLine(s,makeLine(s,'demo0'));completeSale(s,0,now,{memberId:m.id});
+  const memory=new MemoryStorage(),store=new Store(memory);store.restore(s);
+  assert.equal(memberBalance(new Store(memory).state,m.id),255);
+  const invalid=structuredClone(s);invalid.walletEntries[2].balanceAfter++;
+  assert.throws(()=>store.restore(invalid),/餘額/);
+  const missing=structuredClone(s);missing.walletEntries.pop();assert.throws(()=>validateState(missing),/缺少儲值/);
+  const negative=structuredClone(s);negative.walletEntries[0].amount=-10;assert.throws(()=>validateState(negative));
+  assert.equal(memberBalance(store.state,m.id),255);
+});
+test('stale tab cannot duplicate a stored-value debit or top-up',()=>{
+  const memory=new MemoryStorage(),first=new Store(memory),m=first.transaction(s=>createMember(s,{name:'測試會員',openingBalance:100},now));
+  first.transaction(s=>addLine(s,makeLine(s,'demo0')));const stale=new Store(memory);
+  first.transaction(s=>completeSale(s,0,now,{memberId:m.id}));
+  assert.throws(()=>stale.transaction(s=>completeSale(s,0,now,{memberId:m.id})),/另一個分頁/);
+  assert.throws(()=>stale.transaction(s=>topUpMember(s,m.id,50)),/另一個分頁/);
+  assert.equal(memberBalance(new Store(memory).state,m.id),55);
+});
+
+test('stored-value payment permits negative balances and deposits pay down the debt',()=>{
+  const s=initialState(null,null,now),m=createMember(s,{name:'測試會員',openingBalance:30},now);
+  addLine(s,makeLine(s,'demo4'));const sale=completeSale(s,0,now,{memberId:m.id});
+  assert.equal(sale.total,50);assert.equal(sale.balanceAfter,-20);assert.equal(sale.walletAmount,50);assert.equal(sale.payment,'wallet');
+  topUpMember(s,m.id,100,'補儲值','debt-topup',now);assert.equal(memberBalance(s,m.id),80);assert.ok(validateState(s));
+  const memory=new MemoryStorage(),store=new Store(memory);store.restore(s);assert.equal(memberBalance(new Store(memory).state,m.id),80);
+});
+test('zero and already-negative members can charge meals; opening debt is supported',()=>{
+  const s=initialState(null,null,now),m=createMember(s,{name:'測試會員',openingBalance:-10},now);
+  addLine(s,makeLine(s,'demo0'));completeSale(s,0,now,{memberId:m.id});assert.equal(memberBalance(s,m.id),-55);
+  topUpMember(s,m.id,20,'','partial-debt',now);assert.equal(memberBalance(s,m.id),-35);assert.ok(validateState(s));
+  const zero=createMember(s,{name:'零餘額測試'},now);addLine(s,makeLine(s,'demo9'));completeSale(s,0,now,{memberId:zero.id});assert.equal(memberBalance(s,zero.id),-20);assert.ok(validateState(s));
 });
